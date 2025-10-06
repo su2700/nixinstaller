@@ -1,195 +1,230 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# --------------------------------------------------------------
+# NixOS Package Manager Helper
+# Version: 2.2
+# --------------------------------------------------------------
 
-# Simple Nix package installer / uninstaller helper
-# Usage: ./nixinstaller.sh [app-name]
-# If an app-name is provided, the script will prompt to install it (permanent or temporary).
+set -euo pipefail
+IFS=$'\n\t'
 
 CONFIG_FILE="/etc/nixos/configuration.nix"
 
+# --- Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+NC='\033[0m' # No color
+
+# --- Root Check ---
+if [ "$EUID" -ne 0 ]; then
+  echo -e "${RED}Please run this script as root (sudo $0)${NC}" >&2
+  exit 1
+fi
+
+# --- Utility Functions ---
 backup_config() {
   if [ -f "$CONFIG_FILE" ]; then
-    sudo cp "$CONFIG_FILE" "$CONFIG_FILE".bak.$(date +%s)
+    local backup_name="${CONFIG_FILE}.bak.$(date +%s)"
+    cp "$CONFIG_FILE" "$backup_name"
+    echo -e "${GREEN}Backup created:${NC} $backup_name"
   fi
 }
 
 list_system_packages() {
-  # Extract lines between the environment.systemPackages = ... [ and the closing ];
-  if ! grep -q "environment\.systemPackages" "$CONFIG_FILE" 2>/dev/null; then
+  if ! grep -q "environment\.systemPackages" "$CONFIG_FILE"; then
+    echo -e "${YELLOW}No environment.systemPackages block found.${NC}"
     return 1
   fi
 
-  sed -n '/environment\.systemPackages/,/];/p' "$CONFIG_FILE" | sed '1d;$d' | \
-    sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/,$//' | grep -v '^$'
+  awk '
+    BEGIN { in_block=0; started=0 }
+    /environment\.systemPackages/ { in_block=1 }
+    in_block && /\[/ && !started { started=1; next }
+    in_block && /];/ { exit }
+    in_block && started {
+      line=$0
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+      sub(/#.*$/, "", line)
+      sub(/,$/, "", line)
+      sub(/^pkgs\./, "", line)
+      if (length(line) > 0) print line
+    }
+  ' "$CONFIG_FILE"
 }
 
-remove_package_from_config() {
-  pkg="$1"
-  tmpfile=$(mktemp)
-
-  # Re-write the configuration file, skipping the first matching package line inside the systemPackages block
-  awk -v pkg="$pkg" '
-  BEGIN{in_block=0; started=0; skipped=0}
-  /environment\.systemPackages/ {print; in_block=1; next}
-  in_block && /\[/ && !started {print; started=1; next}
-  in_block && started && /\]/ {print; in_block=0; next}
-  {
-    if (in_block && started && !skipped) {
-      line=$0
-      gsub(/^[ \t]+|[ \t]+$/,"",line)
-      sub(/,#.*/,"",line)
-      sub(/#.*$/,"",line)
-      sub(/,$/,"",line)
-      if (line == pkg) { skipped=1; next }
-    }
-    print
-  }
-  END{ if (in_block && !skipped) exit 2 }
-  ' "$CONFIG_FILE" > "$tmpfile"
-
-  if [ $? -eq 0 ]; then
-    sudo mv "$tmpfile" "$CONFIG_FILE"
-    return 0
-  else
-    rm -f "$tmpfile"
-    return 2
+add_environment_block_if_missing() {
+  if ! grep -q "environment\.systemPackages" "$CONFIG_FILE"; then
+    echo -e "${YELLOW}Adding environment.systemPackages block...${NC}"
+    backup_config
+    awk '
+      BEGIN { inserted=0 }
+      /^}$/ && !inserted {
+        print "  environment.systemPackages = with pkgs; ["
+        print "    # Add packages here"
+        print "  ];"
+        inserted=1
+      }
+      { print }
+    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
+    mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
   fi
 }
 
 install_permanent() {
-  pkg="$1"
-  echo "Adding $pkg to $CONFIG_FILE"
+  local pkg="$1"
+  add_environment_block_if_missing
+
+  if list_system_packages | grep -qx "$pkg"; then
+    echo -e "${YELLOW}Package '$pkg' is already installed.${NC}"
+    return
+  fi
+
   backup_config
-  # Add package right after the opening '[' of environment.systemPackages
-  sudo sed -i "/environment\.systemPackages = with pkgs; \[/a \ \ \ \ $pkg" "$CONFIG_FILE"
-  echo "Rebuilding NixOS..."
-  sudo nixos-rebuild switch
-  echo "$pkg has been installed and system has been rebuilt."
+  echo -e "${BLUE}Adding ${pkg} to ${CONFIG_FILE}...${NC}"
+
+  awk -v pkg="$pkg" '
+    BEGIN { added=0 }
+    /environment\.systemPackages[[:space:]]*=[[:space:]]*with[[:space:]]*pkgs;[[:space:]]*\[/ {
+      print; printf("    %s,\n", pkg); added=1; next
+    }
+    { print }
+    END {
+      if (!added) print "Warning: could not add package."
+    }
+  ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
+
+  mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+  echo -e "${GREEN}Rebuilding NixOS...${NC}"
+  nixos-rebuild switch
+  echo -e "${GREEN}Installed '$pkg' successfully.${NC}"
 }
 
 install_temporary() {
-  pkg="$1"
-  echo "Launching nix-shell with $pkg..."
+  local pkg="$1"
+  echo -e "${BLUE}Launching temporary nix-shell with '${pkg}'...${NC}"
   nix-shell -p "$pkg"
 }
 
-do_update() {
-  echo "Updating channels and rebuilding system..."
-  sudo nix-channel --update || true
-  sudo nixos-rebuild switch --upgrade
+remove_package() {
+  local pkg="$1"
+  echo -e "${BLUE}Removing '$pkg' from all Nix configs...${NC}"
+  backup_config
+
+  local found=0
+  while IFS= read -r file; do
+    if grep -qE "pkgs\.${pkg}|[^a-zA-Z0-9_]${pkg}[^a-zA-Z0-9_]" "$file"; then
+      sed -i "/pkgs\.${pkg}/d;/${pkg}[[:space:]]*,$/d;/${pkg}[[:space:]]*$/d" "$file"
+      echo "  → Edited: $file"
+      found=1
+    fi
+  done < <(find /etc/nixos -type f -name "*.nix")
+
+  if [ $found -eq 0 ]; then
+    echo -e "${YELLOW}Package '${pkg}' not found in configuration.${NC}"
+    return
+  fi
+
+  echo -e "${GREEN}Rebuilding system...${NC}"
+  nixos-rebuild switch
+  echo -e "${GREEN}Package '${pkg}' removed and system rebuilt.${NC}"
 }
 
+do_update() {
+  echo -e "${BLUE}Updating channels and rebuilding system...${NC}"
+  nix-channel --update || true
+  nixos-rebuild switch --upgrade
+  echo -e "${GREEN}System updated successfully.${NC}"
+}
+
+view_installed() {
+  echo -e "${BLUE}Installed system packages:${NC}"
+  local pkgs
+  mapfile -t pkgs < <(list_system_packages)
+  if [ ${#pkgs[@]} -eq 0 ]; then
+    echo -e "${YELLOW}(none found)${NC}"
+    return
+  fi
+  for i in "${!pkgs[@]}"; do
+    echo "$((i+1))) ${pkgs[$i]}"
+  done
+}
+
+# --- Main Menu ---
 main_menu() {
   while true; do
     echo
-    echo "Select an action:"
+    echo -e "${BLUE}=== NixOS Package Manager Helper ===${NC}"
     echo "1) Install package (permanent or temporary)"
-    echo "2) Uninstall package (from configuration.nix)"
-    echo "3) Update system (channels + rebuild)"
+    echo "2) Uninstall package"
+    echo "3) Update system"
     echo "4) Temporary nix-shell"
-    echo "5) Quit"
-    read -p "Enter choice [1-5]: " ACTION
+    echo "5) View installed packages"
+    echo "6) Quit"
+    read -rp "Enter choice [1-6]: " ACTION
 
     case "$ACTION" in
       1)
-        read -p "Package name to install: " PKG
-        if [ -z "$PKG" ]; then
-          echo "No package name provided."; continue
-        fi
-        echo "Choose installation type:"
-        echo "1) Permanent (system-wide, configuration.nix)"
-        echo "2) Temporary (nix-shell)"
-        read -p "Enter choice [1-2]: " CHOICE
-        if [ "$CHOICE" == "1" ]; then
-          install_permanent "$PKG"
-        elif [ "$CHOICE" == "2" ]; then
-          install_temporary "$PKG"
-        else
-          echo "Invalid choice.";
-        fi
+        read -rp "Package name to install: " PKG
+        [ -z "$PKG" ] && echo "No package name provided." && continue
+        echo "1) Permanent"
+        echo "2) Temporary"
+        read -rp "Enter choice [1-2]: " TYPE
+        [[ "$TYPE" == "1" ]] && install_permanent "$PKG" || install_temporary "$PKG"
         ;;
-
       2)
-        if [ ! -f "$CONFIG_FILE" ]; then
-          echo "$CONFIG_FILE not found. Cannot uninstall."; continue
-        fi
+        local pkgs
         mapfile -t pkgs < <(list_system_packages)
         if [ ${#pkgs[@]} -eq 0 ]; then
-          echo "No packages found in environment.systemPackages."; continue
+          echo -e "${YELLOW}No packages found in systemPackages.${NC}"
+          continue
         fi
-        echo "Installed packages (from $CONFIG_FILE):"
+
+        echo -e "${BLUE}Installed system packages:${NC}"
         for i in "${!pkgs[@]}"; do
-          idx=$((i+1))
-          echo "$idx) ${pkgs[$i]}"
+          echo "$((i+1))) ${pkgs[$i]}"
         done
-        read -p "Enter the number of the package to uninstall (or 'c' to cancel): " SEL
-        if [ "$SEL" = "c" ] || [ "$SEL" = "C" ]; then
-          echo "Cancelled."; continue
-        fi
-        if ! [[ "$SEL" =~ ^[0-9]+$ ]]; then
-          echo "Invalid selection."; continue
-        fi
-        if [ "$SEL" -lt 1 ] || [ "$SEL" -gt ${#pkgs[@]} ]; then
-          echo "Selection out of range."; continue
-        fi
-        target_pkg=${pkgs[$((SEL-1))]}
-        echo "You chose to remove: $target_pkg"
-        read -p "Proceed and rebuild system? [y/N]: " CONF
-        if [[ "$CONF" =~ ^[Yy]$ ]]; then
-          backup_config
-          remove_package_from_config "$target_pkg"
-          rc=$?
-          if [ $rc -eq 0 ]; then
-            echo "Package removed from $CONFIG_FILE. Rebuilding system..."
-            sudo nixos-rebuild switch
-            echo "Done."
-          elif [ $rc -eq 2 ]; then
-            echo "Package not found inside the systemPackages block; no changes made.";
+        echo
+        read -rp "Enter number of package to uninstall: " CHOICE
+        if [[ "$CHOICE" =~ ^[0-9]+$ ]] && [ "$CHOICE" -ge 1 ] && [ "$CHOICE" -le "${#pkgs[@]}" ]; then
+          target_pkg="${pkgs[$((CHOICE-1))]}"
+          read -rp "Confirm removal of '$target_pkg'? [y/N]: " CONFIRM
+          if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+            remove_package "$target_pkg"
           else
-            echo "Failed to update $CONFIG_FILE.";
+            echo "Cancelled."
           fi
         else
-          echo "Aborted by user.";
+          echo -e "${YELLOW}Invalid selection.${NC}"
         fi
         ;;
-
-      3)
-        do_update
-        ;;
-
+      3) do_update ;;
       4)
-        read -p "Package name for nix-shell: " PKG
-        if [ -z "$PKG" ]; then echo "No package provided."; else install_temporary "$PKG"; fi
+        read -rp "Package name for nix-shell: " PKG
+        [ -z "$PKG" ] && continue
+        install_temporary "$PKG"
         ;;
-
-      5)
-        echo "Goodbye."; exit 0
+      5) view_installed ;;
+      6)
+        echo -e "${GREEN}Goodbye!${NC}"
+        exit 0
         ;;
-
-      *)
-        echo "Invalid choice.";
-        ;;
+      *) echo -e "${YELLOW}Invalid choice.${NC}" ;;
     esac
   done
 }
 
-# If an argument is provided, treat it as package name and go straight to install prompt
-if [ -n "$1" ]; then
-  APP_NAME="$1"
-  echo "Package argument provided: $APP_NAME"
-  echo "Choose installation type:"
-  echo "1) Permanent (system-wide, configuration.nix)"
-  echo "2) Temporary (nix-shell)"
-  read -p "Enter choice [1-2]: " CHOICE
-  if [ "$CHOICE" == "1" ]; then
-    install_permanent "$APP_NAME"
-    exit 0
-  elif [ "$CHOICE" == "2" ]; then
-    install_temporary "$APP_NAME"
-    exit 0
-  else
-    echo "Invalid choice. Exiting."; exit 1
-  fi
+# --- CLI Shortcut Mode ---
+if [[ "${1:-}" == "-y" && -n "${2:-}" ]]; then
+  install_permanent "$2"
+  exit 0
+elif [ -n "${1:-}" ]; then
+  PKG="$1"
+  echo "1) Permanent"
+  echo "2) Temporary"
+  read -rp "Enter choice [1-2]: " CHOICE
+  [[ "$CHOICE" == "1" ]] && install_permanent "$PKG" || install_temporary "$PKG"
+  exit 0
 else
   main_menu
 fi
-
